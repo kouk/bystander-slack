@@ -1,15 +1,22 @@
-from celery import Celery
 from celery.utils.log import get_task_logger
 
 from .bystander import Bystander, BystanderError
+from .conf import TIMEOUT_SECONDS
+from .celery import app
 from .slack import post_ephemeral, SlackError
 
 
-app = Celery('tasks', broker="redis://redis:6379/0")
 logger = get_task_logger(__name__)
 
 
-@app.task
+def notify_expired(user_id, channel_id):
+    post_ephemeral(channel_id, user_id,
+                   ("It looks like this request has timed out before "
+                    "you could accept it, or someone else already "
+                    "accepted it."))
+
+
+@app.task(name='bystander_start')
 def start_bystander(raw_text, requester_id, channel_id):
     bystander = Bystander(raw_text, requester_id, channel_id)
     bystander.process_text()
@@ -35,42 +42,62 @@ def start_bystander(raw_text, requester_id, channel_id):
                        "request")
         return
 
+    bystander.start()
     bystander.save()
     bystander.send_buttons()
+    skip_bystander.apply_async((bystander.id, bystander.user_id),
+                               countdown=TIMEOUT_SECONDS)
 
 
-@app.task
-def accept_bystander(id, user_id, channel_id, requester_id):
+@app.task(name='bystander_accept')
+def accept_bystander(id, user_id, channel_id):
     try:
         bystander = Bystander.load(id)
     except BystanderError:
-        post_ephemeral(channel_id, requester_id,
-                       ("It looks like your request has timed out before "
-                        "someone could accept it, please try again"))
-        post_ephemeral(channel_id, user_id,
-                       ("It looks like this request has timed out before "
-                        "you could accept it"))
+        notify_expired(user_id, channel_id)
     else:
         bystander.accept(user_id)
         bystander.delete()
 
 
-@app.task
-def reject_bystander(id, user_id, channel_id, requester_id):
+@app.task(name='bystander_reject')
+def reject_bystander(id, user_id, channel_id):
     try:
         bystander = Bystander.load(id)
     except BystanderError:
-        post_ephemeral(channel_id, requester_id,
-                       ("It looks like your request has timed out before "
-                        "someone could accept it, please try again"))
-        post_ephemeral(channel_id, user_id,
-                       ("It looks like this request has timed out before "
-                        "you could accept it"))
+        notify_expired(user_id, channel_id)
         return
     bystander.reject(user_id)
-    if bystander.user_ids_left:
+
+    if bystander.user_id != user_id:
+        return
+    bystander.skip(user_id)
+
+    if bystander.user_id:
         bystander.save()
         bystander.send_buttons()
+        skip_bystander.apply_async((bystander.id, bystander.user_id),
+                                   countdown=TIMEOUT_SECONDS)
     else:
         bystander.abort()
         bystander.delete()
+
+
+@app.task(name='bystander_skip')
+def skip_bystander(id, user_id):
+    try:
+        bystander = Bystander.load(id)
+    except BystanderError:
+        return
+
+    if bystander.user_id != user_id:
+        return
+    bystander.skip(user_id)
+
+    if bystander.user_id:
+        bystander.save()
+        bystander.send_buttons()
+        skip_bystander.apply_async((bystander.id, bystander.user_id),
+                                   countdown=TIMEOUT_SECONDS)
+    else:
+        bystander.giveup()

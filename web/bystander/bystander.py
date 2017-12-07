@@ -5,12 +5,12 @@ from uuid import uuid4
 
 from redis import Redis
 
-from .conf import EXPIRE_SECONDS
+from .conf import EXPIRE_SECONDS, REDIS_HOST
 from .slack import (get_members, get_usergroup, post_channel, post_ephemeral,
                     user_is_active)
 
 
-REDIS = Redis('redis', '6379')
+REDIS = Redis(REDIS_HOST, '6379')
 
 
 class BystanderError(Exception):
@@ -27,7 +27,7 @@ class Bystander(object):
 
     def __init__(self, raw_text, requester_id, channel_id):
         self.id = None
-
+        self.user_id = None
         self.raw_text = raw_text
         self.requester_id = requester_id
         self.channel_id = channel_id
@@ -44,6 +44,7 @@ class Bystander(object):
 
         bystander = cls(data['text'], data['requester_id'], data['channel_id'])
         bystander.id = id
+        bystander.user_id = data['user_id']
         bystander.user_ids = data['user_ids']
         bystander.usergroup_ids = data['usergroup_ids']
         bystander.text = data['text']
@@ -51,11 +52,16 @@ class Bystander(object):
 
         return bystander
 
+    def start(self):
+        random.shuffle(self.user_ids)
+        self.user_id = self.user_ids[0]
+        self.id = str(uuid4())
+
     def save(self):
-        if self.id is None:
-            self.id = str(uuid4())
+        assert self.user_id
         REDIS.set(self.id,
                   json.dumps({'user_ids': self.user_ids,
+                              'user_id': self.user_id,
                               'usergroup_ids': self.usergroup_ids,
                               'text': self.text,
                               'requester_id': self.requester_id,
@@ -120,15 +126,14 @@ class Bystander(object):
         """ Send the message with the buttons to a randomly selected user in
             the request
         """
-
-        user_id = random.choice(self.user_ids_left)
-        post_ephemeral(self.channel_id, user_id,
+        if self.user_id is None:
+            raise Exception("No user ID assigned. Forget to call .save()?")
+        post_ephemeral(self.channel_id, self.user_id,
                        "<@{}>, <@{}> has asked you to:".
-                       format(user_id, self.requester_id),
+                       format(self.user_id, self.requester_id),
                        [{'text': self.text},
                         {'text': "Are you up for it:?",
-                         "callback_id": "{}:{}".format(self.id,
-                                                       self.requester_id),
+                         "callback_id": "{}".format(self.id),
                          "attachment_type": "default",
                          "actions": [{'name': "yes", 'text': "Accept",
                                       'type': "button", 'value': "yes",
@@ -137,8 +142,29 @@ class Bystander(object):
                                       'type': "button", 'value': "no",
                                       'style': "danger"}]}])
 
+    def _next_user(self, skip_user):
+        """Return the next user after skipping the given user.
+
+        By default returns the first user ID not in the rejected users list
+        after skipping those user ids that precede the skip_user.
+
+        Returns None if no user could be found (for whatever reason).
+        """
+        remaining = self.user_ids
+        if skip_user in remaining:
+            idx = remaining.index(skip_user)
+            remaining = remaining[idx + 1:]
+        for uid in remaining:
+            if uid in self.rejected_user_ids:
+                continue
+            return uid
+        return None
+
     def reject(self, user_id):
         self.rejected_user_ids.append(user_id)
+
+    def skip(self, user_id):
+        self.user_id = self._next_user(user_id)
 
     def accept(self, user_id):
         post_channel(self.channel_id,
@@ -151,3 +177,9 @@ class Bystander(object):
                        ("I'm sorry. It appears that everyone rejected your "
                         "request :cry:"),
                        [{'text': self.text}])
+
+    def giveup(self):
+        post_ephemeral(self.channel_id, self.requester_id,
+                       ("<@{}>, {} people were notified but no one has "
+                        "accepted yet. We give up! :rage:").format(
+                            self.requester_id, len(self.user_ids)))

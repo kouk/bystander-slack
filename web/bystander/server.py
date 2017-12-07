@@ -39,14 +39,14 @@ def button():
     if data['token'] != INCOMING_TOKEN:
         abort(401)
 
-    id, requester_id = data['callback_id'].split(':', 1)
+    id = data['callback_id']
     user_id = data['user']['id']
     channel_id = data['channel']['id']
 
     if data['actions'][0]['name'] == "yes":
-        accept_bystander.delay(id, user_id, channel_id, requester_id)
+        accept_bystander.delay(id, user_id, channel_id)
     else:
-        reject_bystander.delay(id, user_id, channel_id, requester_id)
+        reject_bystander.delay(id, user_id, channel_id)
 
     return jsonify({'response_type': "ephemeral",
                     'text': "Thank you for your choice"})
